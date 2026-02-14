@@ -6,6 +6,8 @@ Manufacturers then begin cooperating Microsoft producing Windows Hello Devices
 such as fingerprint and IR cameras.  
 But what will happen if you try to plug such device onto Linux?
 ## 0x01 Introduction
+The device is made by Realtek which has a Realtek vendor ID and REALSIL id (see below)  
+and has two cameras and a IR emitter. Two streams are mutex locked.
 Back in the days when I'm using Windows 10, I saw this on Xianyu for 30 RMB.
 
 Why not buy one just for fun?
