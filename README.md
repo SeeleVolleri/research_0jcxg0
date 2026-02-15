@@ -57,7 +57,7 @@ Go start Windows Hello setup steps.
 Actually you cancel once you see your face to reduce data.  
 
 Go back to wireshark, stop capture.
-##0x03 What's on hands?
+## 0x03 What's on hands?
 `1.22.0	host	0xffffffff	USB	813	GET DESCRIPTOR Response CONFIGURATION`  
 includes `VIDEO CONTROL INTERFACE DESCRIPTOR [Extension Unit] (Entity 4)`  
 includes `guid: 1229a78c-47b4-4094-b0ce-db07386fb938`
