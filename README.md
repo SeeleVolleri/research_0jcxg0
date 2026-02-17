@@ -63,8 +63,6 @@ includes `VIDEO CONTROL INTERFACE DESCRIPTOR [Extension Unit] (Entity 4)`
 includes `guid: 1229a78c-47b4-4094-b0ce-db07386fb938`
 Now we got
 
-Fuck I gave up, you just throw all these to AI and he'll tell you
-
 ### Extension Unit info
 - Unit ID: 0x04
 - GUID: {1229a78c-47b4-4094-b0ce-db07386fb938}
