@@ -1,13 +1,13 @@
 # Researching Dell 0JCXG0
 ## 0x00 Abstract
-Microsoft obviously do not satisfy with password or hardware passkeys back in 2015  
-So they created Windows Hello and Windows Hello compatible standard.  
+Microsoft obviously do not satisfy with password or hardware passkeys back in 2015
+So they created Windows Hello and Windows Hello compatible standard.
 Manufacturers then begin cooperating Microsoft producing Windows Hello Devices
-such as fingerprint and IR cameras.  
+such as fingerprint and IR cameras.
 But what will happen if you try to plug such device onto Linux?
 ## 0x01 Introduction
-The device is made by Realtek which has a Realtek vendor ID and REALSIL id (see below)  
-and has two cameras and a IR emitter. Two streams are mutex locked.  
+The device is made by Realtek which has a Realtek vendor ID and REALSIL id (see below)
+and has two cameras and a IR emitter. Two streams are mutex locked.
 Back in the days when I'm using Windows 10, I saw this on Xianyu for 30 RMB.
 
 Why not buy one just for fun?
@@ -18,14 +18,14 @@ see coke was transparent in IR vision, first time night vision.
 Until I plug it on Linux using [Howdy](https://github.com/boltgolt/howdy)
 trying to setup facial recognition. It failed.
 
-Back in the good old days, this young man have no idea about Open Source.  
-Young man do not know he need to send specific command to activate IR mode,  
-So he didn't know he need reverse engineer to obtain vendor specific command(XU).  
-So he didn't know he need usbmon and wireshark to reverse engineer.  
+Back in the good old days, this young man have no idea about Open Source.
+Young man do not know he need to send specific command to activate IR mode,
+So he didn't know he need reverse engineer to obtain vendor specific command(XU).
+So he didn't know he need usbmon and wireshark to reverse engineer.
 ## 0x02 Get hands dirty
-Wireshark is a tool that can capture, analyze frames that not limited to network.  
-TCPDump is a tool that can capture a device and convert it to pcap format.  
-SSH is a tool that can acts as a pipe.  
+Wireshark is a tool that can capture, analyze frames that not limited to network.
+TCPDump is a tool that can capture a device and convert it to pcap format.
+SSH is a tool that can acts as a pipe.
 usbmon is a module that can let you capture USB communicate on a linux machine.
 
 I believe you'll dive into manpages.
@@ -39,8 +39,8 @@ Bus 001 Device 021: ID 0bda:5767 Realtek Semiconductor Corp. Integrated_Webcam_H
 
 There. `Bus 001 Device 021`. Now let's plug it out and
 
-Immediately start capturing USB bus 1 on hypervisor to view your loot.  
-`ssh root@hypervisor tcpdump -i usbmon1 -w - | wireshark -k -i -`  
+Immediately start capturing USB bus 1 on hypervisor to view your loot.
+`ssh root@hypervisor tcpdump -i usbmon1 -w - | wireshark -k -i -`
 Please don't ask why usbmonx not exist.
 
 We now see various frames, let's apply filter `usb.bus_id == 1 && usb.device_address == 22`
@@ -50,18 +50,18 @@ What, nothing? Did you plug the cam back or messed the device address?
 
 Now we see some noisy frames between device and host.
 
-Now start the VM. libvirt, PVE, whatever. Go passthrough the usb device to a Windows Guest. 
-Go install driver.  
-Go reboot guest.  
-Go start Windows Hello setup steps.  
-Actually you cancel once you see your face to reduce data.  
+Now start the VM. libvirt, PVE, whatever. Go passthrough the usb device to a Windows Guest.
+Go install driver.
+Go reboot guest.
+Go start Windows Hello setup steps.
+Actually you cancel once you see your face to reduce data.
 
 Go back to wireshark, stop capture.
 ## 0x03 What's on hands?
-`1.22.0	host	0xffffffff	USB	813	GET DESCRIPTOR Response CONFIGURATION`  
-includes `VIDEO CONTROL INTERFACE DESCRIPTOR [Extension Unit] (Entity 4)`  
+`1.22.0    host    0xffffffff    USB    813    GET DESCRIPTOR Response CONFIGURATION`
+includes `VIDEO CONTROL INTERFACE DESCRIPTOR [Extension Unit] (Entity 4)`
 includes `guid: 1229a78c-47b4-4094-b0ce-db07386fb938`
-Now we got 
+Now we got
 
 Fuck I gave up, you just throw all these to AI and he'll tell you
 
@@ -157,20 +157,104 @@ Repeat the configuration sequence from Phase 2:
 | 63 | 3377/3378 | ~38730 | SET_INTERFACE | - | Intf=1, Alt=7 | ACK | **Activate stream alt setting** |
 | 64 | **3379** | **38884** | - | - | (isochronous) | - | **IR video data starts** |
 
-(todo)
-Basiclly you only need send 
+### Phase 5: Stream Stop & RGB Restore (Frame 4054-4192)
 
-0x0a     │ ff 00 00 00 00 00 00 00  
-0x0a     │ 00 fb 00 00 05 00 00 00  
-0x0b     │ 00 9f 00 00 01 00 00 00  
-0x0a     │ 00 9f 00 00 01 00 00 00  
-0x0b     │ 00 00 00 00 00 00 00 00  
+45 million lines of isochronous later (that's my face in IR, no you can't see it),
+Windows closes the camera.
 
-to activate 640x480 YUV420 IR stream.  
-Beware application should not touch format, otherwise camera will fall back to RGB.
+| # | Frame | Action | Data |
+|---|-------|--------|------|
+| 1 | 4055/4056 | SET_INTERFACE | Alt=0 (stop stream) |
+| 2 | 4057/4058 | SET_CUR 0x0a | `00 9f 00 00 01 00 00 00` |
+| 3 | 4059/4060 | SET_CUR 0x0b | `01 00 00 00 00 00 00 00` |
 
-(todo)
+That's it. Write `0x01` to register `0x9f00`. Camera goes back to RGB.
 
-eXtention Unit commands was a standard. for viewers, you don't really need to [read it](https://www.kernel.org/doc/html/latest/userspace-api/media/drivers/uvcvideo.html#extension-unit-xu-support).
+Then Windows re-runs the firmware config dance (0xfb00 + 0xff), gets EPIPE on first
+attempt, retries, reads `80 02 e0 01 11`, writes `0x00` to `0x9f00`, and restarts the
+stream. Same format, same resolution. Normal camera again.
 
-(ending todo)
+### TL;DR
+
+Before each GET_CUR or SET_CUR on the data register (selector 0x0b),
+the firmware needs a four-step prep sequence on the command register (selector 0x0a):
+
+```
+Sel  Dir      │ Data                      │
+─────┬────────┼───────────────────────────┤
+0x0a SET_CUR  │ ff 00 00 00 00 00 00 00   │ 1. Reset
+0x0a SET_CUR  │ 00 fb 00 00 05 00 00 00   │ 2. Address: 0xfb00 (len=5)
+0x0b GET_CUR  │ (read, result ignored)    │ 3. Prime firmware state machine
+0x0a SET_CUR  │ 00 9f 00 00 01 00 00 00   │ 4. Address: 0x9f00 (len=1)
+```
+
+Then the actual mode switch is one SET_CUR on 0x0b:
+
+```
+0x0b SET_CUR  │ 00 00 00 00 00 00 00 00   │ → IR mode  (0x9f00 = 0)
+0x0b SET_CUR  │ 01 00 00 00 00 00 00 00   │ → RGB mode (0x9f00 = 1)
+```
+
+to activate 640×480 YUY2 IR stream.
+
+Step 3 (the GET_CUR that reads 0xfb00) sounds useless, but without it,
+switching back to IR from RGB fails silently — the camera stays in RGB
+while pretending to accept the command. Classic vendor firmware.
+
+Beware: application should not touch format, otherwise camera will fall back to RGB.
+Camera must use bFormatIndex 2 (YUY2 Uncompressed), bFrameIndex 1 (640×480).
+Request MJPEG or a different resolution and the firmware ignores the IR command silently.
+
+## 0x04 Ship It
+
+eXtension Unit commands are [a standard](https://www.kernel.org/doc/html/latest/userspace-api/media/drivers/uvcvideo.html#extension-unit-xu-support).
+For viewers, you don't really need to read it.
+For driver writers, just grep the existing quirks in `drivers/media/usb/uvc/`.
+
+So I have 5 commands. Four prep + one mode byte. Now what?
+
+Option A: Userspace via `UVCIOC_CTRL_QUERY`. Send the raw bytes yourself.
+Works, but then every application needs to know the magic sequence.
+
+Option B: Kernel driver quirk. Expose a V4L2 control. Applications just flip a switch.
+
+I chose B.
+
+The control is `V4L2_CID_BAND_STOP_FILTER` — an IR cut filter:
+- `1` (default) = filter ON = blocks IR = normal RGB camera
+- `0` = filter OFF = IR passthrough = see in the dark
+
+```bash
+# IR mode
+v4l2-ctl -d /dev/video0 --set-ctrl=band_stop_filter=0
+# RGB mode
+v4l2-ctl -d /dev/video0 --set-ctrl=band_stop_filter=1
+```
+
+The implementation adds a `uvc_control_mapping` and a `prepare` callback in `uvc_ctrl.c`.
+The `prepare` callback fires the four-step prep sequence before any access to selector 0x0b.
+A `need_suspend` flag tells the framework to stop the stream before switching —
+otherwise the camera outputs corrupted frames (half-RGB half-IR, very cursed).
+
+Four patches, ~300 lines total:
+
+1. **Device identification** — recognize `0bda:5767`, define the XU GUID, add `UVC_QUIRK_DELL_IR`
+2. **Prepare callback infrastructure** — `prepare` and `need_suspend` hooks in `struct uvc_control`
+3. **IR mode switching** — the mapping, get/set callbacks, prep sequence, flags fixup
+4. **Probe-time register dump** — read `0xcd00`-`0xcd09` at probe, log via `uvc_dbg(PROBE)`
+
+No separate video device, no module parameters, no timeout protection,
+no exclusive access locks. Just a quirk.
+
+## 0xFF
+
+A ¥30 camera from Xianyu. A 3.2 GB Wireshark dump. 45 million lines of hex.
+
+Windows sends 60 vendor-specific commands to switch modes.
+The kernel driver needs 5.
+But it took mass staring at hex to figure out which 5.
+
+If you have a Dell laptop with a 0JCXG0 camera and want IR on Linux,
+the patches are on mainline. Or just wait until your distro ships a kernel that includes them.
+
+And yes, coke is still transparent under IR.
