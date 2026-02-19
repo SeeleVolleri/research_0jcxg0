@@ -1,0 +1,262 @@
+From e4299c68bf6beb082fc98d8d71107b38d5b7c538 Mon Sep 17 00:00:00 2001
+From: Seele Volleri <33335@disroot.org>
+Date: Tue, 17 Feb 2026 23:33:29 +0000
+Subject: [PATCH 5/5] media: uvcvideo: improve Dell 0JCXG0 probe-time register
+ dump
+
+Rework the probe-time diagnostic dump for the Dell 0JCXG0 IR camera
+(Realtek 0bda:5767) based on cross-referencing the reverse-engineered
+RtsUVC.sys driver with USB capture data.
+
+Changes:
+
+  - Read all 10 sub-indices (0-9) of register 0xCD, matching the
+    Windows driver's GetFWInfo_VendorCmd loop.  The previous code
+    skipped sub-indices 3, 5, 6, 7, 9 and included a spurious
+    sub-index 12 that the Windows driver never reads.
+
+  - Parse sub-index 2 as a date string (purpose unknown, observed
+    as "08/18/15" in USB captures).
+
+  - Add register 0xFA (IR capability flags, 2 bytes), read by the
+    Windows driver's GetIRInfo function to detect IR support.
+
+  - Add register 0xFB with len=6 (extended IR format), which
+    includes the IR LED PWM maximum value at byte 5.  The Windows
+    driver tries this first and falls back to len=5 on failure.
+
+  - Skip all USB transfers when the PROBE trace flag is not set.
+    Previously the register reads executed unconditionally at probe
+    time even though the output was only visible with trace=1.
+
+  - Extract the set-address + read-data sequence into a helper
+    function (uvc_dell_ir_read_reg) to reduce repetition.
+
+Register layouts verified against RtsUVC.sys (GetFWInfo_VendorCmd at
+sub_140278140, GetIRInfo at sub_140278820, GetIRFormat at
+sub_1402786E0) and USB capture frames 3005-3083.
+
+Signed-off-by: Seele Volleri <33335@disroot.org>
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ drivers/media/usb/uvc/uvc_driver.c | 164 +++++++++++++++++++++--------
+ 1 file changed, 120 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index be7c2275d803..4568275879c4 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -2172,32 +2172,61 @@ static int uvc_register_chains(struct uvc_device *dev)
+  * Dell 0JCXG0 IR camera: read device identification registers at probe time
+  * via the XU two-register protocol and log them for diagnostic purposes.
+  *
+- * Register 0xCD sub-index 0 contains the module vendor/product IDs and
+- * firmware/hardware versions; sub-index 8 contains the firmware revision.
+- * Field layout determined by reverse-engineering the Windows RtsUVC.sys driver.
++ * The Windows RtsUVC.sys driver reads the following at init time:
++ *   - Register 0xCD sub-indices 0-9 (GetFWInfo_VendorCmd): device info.
++ *     Sub-index 0 contains module VID/PID and FW/HW versions.
++ *     Sub-index 2 contains a date as an ASCII string (purpose unknown).
++ *     Sub-index 8 contains the firmware revision.
++ *     Sub-indices 1, 3-7, 9 are read but discarded by the driver.
++ *   - Register 0xD0 (chip vendor string, e.g. "REALSIL").
++ *   - Register 0xFA (IR capability flags, 2 bytes).
++ *   - Register 0xFB len=5 (IR format: width, height, pixel format).
++ *   - Register 0xFB len=6 (extended: IR format + LED PWM max at byte 5).
++ *
++ * Field layouts determined by reverse-engineering RtsUVC.sys.
++ */
++
++/*
++ * Helper: set the XU address register (selector 0x0a) and read the data
++ * register (selector 0x0b).  Returns 0 on success, negative errno on failure.
++ * On success, @buf contains the data read (up to 8 bytes).
+  */
++static int uvc_dell_ir_read_reg(struct uvc_device *dev,
++				struct uvc_entity *entity,
++				u8 reg, u8 idx_lo, u8 idx_hi, u8 len,
++				u8 *buf)
++{
++	int ret;
++
++	/* Set address register. */
++	memset(buf, 0, 8);
++	buf[0] = 0x00;
++	buf[1] = reg;
++	buf[2] = idx_lo;
++	buf[3] = idx_hi;
++	buf[4] = len;
++	ret = uvc_query_ctrl(dev, UVC_SET_CUR, entity->id,
++			     dev->intfnum, 0x0a, buf, 8);
++	if (ret < 0)
++		return ret;
++
++	/* Read data register. */
++	memset(buf, 0, 8);
++	return uvc_query_ctrl(dev, UVC_GET_CUR, entity->id,
++			      dev->intfnum, 0x0b, buf, 8);
++}
++
+ static void uvc_probe_dell_ir(struct uvc_device *dev)
+ {
+ 	static const u8 dell_ir_guid[] = UVC_GUID_DELL_0JCXG0_XU;
+-	static const struct {
+-		u16 addr;
+-		u8 len;
+-		const char *name;
+-	} regs[] = {
+-		{ 0xcd00, 8, "fw info" },
+-		{ 0xcd01, 8, "unknown 01" },
+-		{ 0xcd02, 8, "unknown 02" },
+-		{ 0xcd04, 8, "unknown 04" },
+-		{ 0xcd08, 8, "revision" },
+-		{ 0xcd12, 8, "unknown 12" },
+-		{ 0xd000, 8, "chip vendor" },
+-		{ 0xfb00, 5, "ir format" },
+-	};
+ 	struct uvc_entity *entity;
+ 	u8 *cmd;
+ 	int ret;
+ 	unsigned int i;
+ 
++	if (!(uvc_dbg_param & UVC_DBG_PROBE))
++		return;
++
+ 	list_for_each_entry(entity, &dev->entities, list) {
+ 		if (memcmp(entity->guid, dell_ir_guid, 16) == 0)
+ 			break;
+@@ -2220,44 +2249,30 @@ static void uvc_probe_dell_ir(struct uvc_device *dev)
+ 		goto out;
+ 	}
+ 
+-	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+-		/* Set address register. */
+-		memset(cmd, 0, 8);
+-		cmd[1] = regs[i].addr >> 8;
+-		cmd[2] = regs[i].addr & 0xff;
+-		cmd[4] = regs[i].len;
+-		ret = uvc_query_ctrl(dev, UVC_SET_CUR, entity->id,
+-				     dev->intfnum, 0x0a, cmd, 8);
+-		if (ret < 0) {
+-			uvc_dbg(dev, PROBE,
+-				"Dell IR: set addr 0x%04x failed (%d)\n",
+-				regs[i].addr, ret);
+-			continue;
+-		}
+-
+-		/* Read data register. */
+-		memset(cmd, 0, 8);
+-		ret = uvc_query_ctrl(dev, UVC_GET_CUR, entity->id,
+-				     dev->intfnum, 0x0b, cmd, 8);
++	/*
++	 * Register 0xCD: device identification (10 sub-indices, 8 bytes each).
++	 * The Windows driver reads all 10 in a loop but only extracts fields
++	 * from sub-index 0 (VID/PID/FW/HW) and sub-index 8 (REV).
++	 */
++	for (i = 0; i < 10; i++) {
++		ret = uvc_dell_ir_read_reg(dev, entity, 0xcd, i, 0, 8, cmd);
+ 		if (ret < 0) {
+ 			uvc_dbg(dev, PROBE,
+-				"Dell IR: read 0x%04x failed (%d)\n",
+-				regs[i].addr, ret);
++				"Dell IR: reg 0xcd%02u failed (%d)\n", i, ret);
+ 			continue;
+ 		}
+ 
+ 		uvc_dbg(dev, PROBE,
+-			"Dell IR: reg 0x%04x (%s) = %*ph\n",
+-			regs[i].addr, regs[i].name, regs[i].len, cmd);
++			"Dell IR: reg 0xcd%02u = %8ph\n", i, cmd);
+ 
+ 		/*
+-		 * 0xCD sub-index 0: module identification.
++		 * Sub-index 0: module identification.
+ 		 *   bytes 0-1: module VID (LE)
+ 		 *   bytes 2-3: module PID (LE)
+ 		 *   bytes 4-5: firmware version (LE)
+ 		 *   bytes 6-7: hardware version (BE)
+ 		 */
+-		if (regs[i].addr == 0xcd00)
++		if (i == 0)
+ 			uvc_dbg(dev, PROBE,
+ 				"Dell IR: VID=%04x PID=%04x FW=%04x HW=%04x\n",
+ 				get_unaligned_le16(&cmd[0]),
+@@ -2265,12 +2280,73 @@ static void uvc_probe_dell_ir(struct uvc_device *dev)
+ 				get_unaligned_le16(&cmd[4]),
+ 				get_unaligned_be16(&cmd[6]));
+ 
+-		/* 0xCD sub-index 8: firmware revision in bytes 6-7 (BE). */
+-		if (regs[i].addr == 0xcd08)
++		/* Sub-index 2: date string (purpose unknown, e.g. "08/18/15"). */
++		if (i == 2)
++			uvc_dbg(dev, PROBE,
++				"Dell IR: FW date=%.8s\n", cmd);
++
++		/* Sub-index 8: firmware revision in bytes 6-7 (BE). */
++		if (i == 8)
+ 			uvc_dbg(dev, PROBE, "Dell IR: REV=%04x\n",
+ 				get_unaligned_be16(&cmd[6]));
+ 	}
+ 
++	/* Register 0xD0: chip vendor string (e.g. "REALSIL\0"). */
++	ret = uvc_dell_ir_read_reg(dev, entity, 0xd0, 0, 0, 8, cmd);
++	if (ret < 0)
++		uvc_dbg(dev, PROBE,
++			"Dell IR: reg 0xd000 failed (%d)\n", ret);
++	else
++		uvc_dbg(dev, PROBE,
++			"Dell IR: chip vendor=%.8s\n", cmd);
++
++	/*
++	 * Register 0xFA: IR capability (2 bytes).
++	 * Byte 0-1: IR presence flags.  Non-zero means IR is supported.
++	 * Read by GetIRInfo in the Windows driver.
++	 */
++	ret = uvc_dell_ir_read_reg(dev, entity, 0xfa, 0, 0, 2, cmd);
++	if (ret < 0)
++		uvc_dbg(dev, PROBE,
++			"Dell IR: reg 0xfa00 failed (%d)\n", ret);
++	else
++		uvc_dbg(dev, PROBE,
++			"Dell IR: IR capability=%02x %02x\n",
++			cmd[0], cmd[1]);
++
++	/*
++	 * Register 0xFB len=5: IR format (basic).
++	 *   bytes 0-1: width (LE)
++	 *   bytes 2-3: height (LE)
++	 *   byte 4: pixel format (0x11=YUY2, 0x22=MJPG/NV12)
++	 */
++	ret = uvc_dell_ir_read_reg(dev, entity, 0xfb, 0, 0, 5, cmd);
++	if (ret < 0)
++		uvc_dbg(dev, PROBE,
++			"Dell IR: reg 0xfb00 (basic) failed (%d)\n", ret);
++	else
++		uvc_dbg(dev, PROBE,
++			"Dell IR: IR res=%ux%u fmt=0x%02x\n",
++			get_unaligned_le16(&cmd[0]),
++			get_unaligned_le16(&cmd[2]),
++			cmd[4]);
++
++	/*
++	 * Register 0xFB len=6: IR format (extended).
++	 *   bytes 0-4: same as basic format
++	 *   byte 5: IR LED PWM maximum value
++	 * The Windows driver tries len=6 first; if it fails, the firmware
++	 * auto-resets and the driver retries with len=5 (basic).
++	 */
++	ret = uvc_dell_ir_read_reg(dev, entity, 0xfb, 0, 0, 6, cmd);
++	if (ret < 0)
++		uvc_dbg(dev, PROBE,
++			"Dell IR: reg 0xfb00 (extended) failed (%d)\n", ret);
++	else
++		uvc_dbg(dev, PROBE,
++			"Dell IR: IR extended=%*ph (LED PWM max=%u)\n",
++			6, cmd, cmd[5]);
++
+ out:
+ 	kfree(cmd);
+ }
+-- 
+2.47.3
+

@@ -1,0 +1,162 @@
+From 622531e7cae42f4c89c89b3338194414ee2ac28f Mon Sep 17 00:00:00 2001
+From: Seele Volleri <33335@disroot.org>
+Date: Mon, 16 Feb 2026 21:51:22 +0000
+Subject: [PATCH 4/5] media: uvcvideo: add Dell 0JCXG0 probe-time register dump
+
+Read device identification registers via the XU two-register protocol
+at probe time and log them via uvc_dbg(PROBE) for the Dell 0JCXG0 IR
+camera (Realtek 0bda:5767).
+
+Register 0xCD sub-index 0 contains the module vendor/product IDs and
+firmware/hardware versions; sub-index 8 contains the firmware revision.
+These fields are parsed and logged as structured values alongside the
+raw hex dump.  Field layout was determined by reverse-engineering the
+Windows RtsUVC.sys driver's GetFWInfo_VendorCmd routine, which reads
+register 0xCD sub-indices 0-9 and extracts VID, PID, FW version, HW
+version (from sub-index 0) and REV (from sub-index 8).
+
+The Windows driver reads sub-indices 1-7 and 9 but discards their
+contents; they are included here as raw hex dumps in case they carry
+useful information on other firmware versions.  Registers 0xD0 (chip
+vendor string) and 0xFB (IR format) are also read for diagnostic
+completeness.
+
+The dump is visible only when the PROBE trace flag is enabled
+(modprobe uvcvideo trace=1).
+
+Signed-off-by: Seele Volleri <33335@disroot.org>
+---
+ drivers/media/usb/uvc/uvc_driver.c | 110 +++++++++++++++++++++++++++++
+ 1 file changed, 110 insertions(+)
+
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index 0a3a2f3fe4c3..be7c2275d803 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -2168,6 +2168,113 @@ static int uvc_register_chains(struct uvc_device *dev)
+  * USB probe, disconnect, suspend and resume
+  */
+ 
++/*
++ * Dell 0JCXG0 IR camera: read device identification registers at probe time
++ * via the XU two-register protocol and log them for diagnostic purposes.
++ *
++ * Register 0xCD sub-index 0 contains the module vendor/product IDs and
++ * firmware/hardware versions; sub-index 8 contains the firmware revision.
++ * Field layout determined by reverse-engineering the Windows RtsUVC.sys driver.
++ */
++static void uvc_probe_dell_ir(struct uvc_device *dev)
++{
++	static const u8 dell_ir_guid[] = UVC_GUID_DELL_0JCXG0_XU;
++	static const struct {
++		u16 addr;
++		u8 len;
++		const char *name;
++	} regs[] = {
++		{ 0xcd00, 8, "fw info" },
++		{ 0xcd01, 8, "unknown 01" },
++		{ 0xcd02, 8, "unknown 02" },
++		{ 0xcd04, 8, "unknown 04" },
++		{ 0xcd08, 8, "revision" },
++		{ 0xcd12, 8, "unknown 12" },
++		{ 0xd000, 8, "chip vendor" },
++		{ 0xfb00, 5, "ir format" },
++	};
++	struct uvc_entity *entity;
++	u8 *cmd;
++	int ret;
++	unsigned int i;
++
++	list_for_each_entry(entity, &dev->entities, list) {
++		if (memcmp(entity->guid, dell_ir_guid, 16) == 0)
++			break;
++	}
++	if (&entity->list == &dev->entities)
++		return;
++
++	cmd = kmalloc(8, GFP_KERNEL);
++	if (!cmd)
++		return;
++
++	/* Send firmware reset command (0xff). */
++	memset(cmd, 0, 8);
++	cmd[0] = 0xff;
++	ret = uvc_query_ctrl(dev, UVC_SET_CUR, entity->id,
++			     dev->intfnum, 0x0a, cmd, 8);
++	if (ret < 0) {
++		uvc_dbg(dev, PROBE,
++			"Dell IR: reset command failed (%d)\n", ret);
++		goto out;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(regs); i++) {
++		/* Set address register. */
++		memset(cmd, 0, 8);
++		cmd[1] = regs[i].addr >> 8;
++		cmd[2] = regs[i].addr & 0xff;
++		cmd[4] = regs[i].len;
++		ret = uvc_query_ctrl(dev, UVC_SET_CUR, entity->id,
++				     dev->intfnum, 0x0a, cmd, 8);
++		if (ret < 0) {
++			uvc_dbg(dev, PROBE,
++				"Dell IR: set addr 0x%04x failed (%d)\n",
++				regs[i].addr, ret);
++			continue;
++		}
++
++		/* Read data register. */
++		memset(cmd, 0, 8);
++		ret = uvc_query_ctrl(dev, UVC_GET_CUR, entity->id,
++				     dev->intfnum, 0x0b, cmd, 8);
++		if (ret < 0) {
++			uvc_dbg(dev, PROBE,
++				"Dell IR: read 0x%04x failed (%d)\n",
++				regs[i].addr, ret);
++			continue;
++		}
++
++		uvc_dbg(dev, PROBE,
++			"Dell IR: reg 0x%04x (%s) = %*ph\n",
++			regs[i].addr, regs[i].name, regs[i].len, cmd);
++
++		/*
++		 * 0xCD sub-index 0: module identification.
++		 *   bytes 0-1: module VID (LE)
++		 *   bytes 2-3: module PID (LE)
++		 *   bytes 4-5: firmware version (LE)
++		 *   bytes 6-7: hardware version (BE)
++		 */
++		if (regs[i].addr == 0xcd00)
++			uvc_dbg(dev, PROBE,
++				"Dell IR: VID=%04x PID=%04x FW=%04x HW=%04x\n",
++				get_unaligned_le16(&cmd[0]),
++				get_unaligned_le16(&cmd[2]),
++				get_unaligned_le16(&cmd[4]),
++				get_unaligned_be16(&cmd[6]));
++
++		/* 0xCD sub-index 8: firmware revision in bytes 6-7 (BE). */
++		if (regs[i].addr == 0xcd08)
++			uvc_dbg(dev, PROBE, "Dell IR: REV=%04x\n",
++				get_unaligned_be16(&cmd[6]));
++	}
++
++out:
++	kfree(cmd);
++}
++
+ static const struct uvc_device_info uvc_quirk_none = { 0 };
+ 
+ static int uvc_probe(struct usb_interface *intf,
+@@ -2334,6 +2441,9 @@ static int uvc_probe(struct usb_interface *intf,
+ 	if (!(dev->quirks & UVC_QUIRK_DISABLE_AUTOSUSPEND))
+ 		usb_enable_autosuspend(udev);
+ 
++	if (dev->quirks & UVC_QUIRK_DELL_IR)
++		uvc_probe_dell_ir(dev);
++
+ 	uvc_dbg(dev, PROBE, "UVC device initialized\n");
+ 
+ 	return 0;
+-- 
+2.47.3
+

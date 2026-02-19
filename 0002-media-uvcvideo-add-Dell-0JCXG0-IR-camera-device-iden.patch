@@ -1,0 +1,75 @@
+From a7141fb1c9b3ede1a17da095667594ae82443d68 Mon Sep 17 00:00:00 2001
+From: Seele Volleri <33335@disroot.org>
+Date: Mon, 16 Feb 2026 21:47:00 +0000
+Subject: [PATCH 2/5] media: uvcvideo: add Dell 0JCXG0 IR camera device
+ identification
+
+Add support for recognizing the Dell 0JCXG0 IR camera module (Realtek
+0bda:5767) found in Dell laptops with Windows Hello support.
+
+  - Define UVC_GUID_DELL_0JCXG0_XU for the camera's Extension Unit
+    (GUID 1229a78c-47b4-4094-b0ce-db07386fb938).
+
+  - Define UVC_QUIRK_DELL_IR quirk flag.
+
+  - Add USB device ID table entry for 0bda:5767.
+
+No functional behavior is added by this patch; it only enables device
+detection for subsequent patches.
+
+Signed-off-by: Seele Volleri <33335@disroot.org>
+---
+ drivers/media/usb/uvc/uvc_driver.c | 9 +++++++++
+ drivers/media/usb/uvc/uvcvideo.h   | 1 +
+ include/linux/usb/uvc.h            | 3 +++
+ 3 files changed, 13 insertions(+)
+
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index ee4f54d68349..0a3a2f3fe4c3 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -3236,6 +3236,15 @@ static const struct usb_device_id uvc_ids[] = {
+ 	  .bInterfaceSubClass	= 1,
+ 	  .bInterfaceProtocol	= 0,
+ 	  .driver_info		= UVC_INFO_META(V4L2_META_FMT_D4XX) },
++	/* Dell 0JCXG0 IR Camera (Realtek 0bda:5767) */
++	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
++				| USB_DEVICE_ID_MATCH_INT_INFO,
++	  .idVendor		= 0x0bda,
++	  .idProduct		= 0x5767,
++	  .bInterfaceClass	= USB_CLASS_VIDEO,
++	  .bInterfaceSubClass	= 1,
++	  .bInterfaceProtocol	= 0,
++	  .driver_info		= UVC_INFO_QUIRK(UVC_QUIRK_DELL_IR) },
+ 	/* Generic USB Video Class */
+ 	{ USB_INTERFACE_INFO(USB_CLASS_VIDEO, 1, UVC_PC_PROTOCOL_UNDEFINED) },
+ 	{ USB_INTERFACE_INFO(USB_CLASS_VIDEO, 1, UVC_PC_PROTOCOL_15) },
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index ac316c356fc6..ddfde95f478d 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -80,6 +80,7 @@
+ #define UVC_QUIRK_INVALID_DEVICE_SOF	0x00010000
+ #define UVC_QUIRK_MJPEG_NO_EOF		0x00020000
+ #define UVC_QUIRK_MSXU_META		0x00040000
++#define UVC_QUIRK_DELL_IR		0x00080000
+ 
+ /* Format flags */
+ #define UVC_FMT_FLAG_COMPRESSED		0x00000001
+diff --git a/include/linux/usb/uvc.h b/include/linux/usb/uvc.h
+index 22e0dab0809e..20700e00e28f 100644
+--- a/include/linux/usb/uvc.h
++++ b/include/linux/usb/uvc.h
+@@ -35,6 +35,9 @@
+ #define UVC_GUID_MSXU_1_5 \
+ 	{0xdc, 0x95, 0x3f, 0x0f, 0x32, 0x26, 0x4e, 0x4c, \
+ 	 0x92, 0xc9, 0xa0, 0x47, 0x82, 0xf4, 0x3b, 0xc8}
++#define UVC_GUID_DELL_0JCXG0_XU \
++	{0x8c, 0xa7, 0x29, 0x12, 0xb4, 0x47, 0x94, 0x40, \
++	 0xb0, 0xce, 0xdb, 0x07, 0x38, 0x6f, 0xb9, 0x38}
+ 
+ /* https://learn.microsoft.com/en-us/windows-hardware/drivers/stream/uvc-extensions-1-5#222-extension-unit-controls */
+ #define UVC_MSXU_CONTROL_FOCUS			0x01
+-- 
+2.47.3
+

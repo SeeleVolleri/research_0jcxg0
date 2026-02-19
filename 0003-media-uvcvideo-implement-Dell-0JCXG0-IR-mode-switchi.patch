@@ -1,0 +1,242 @@
+From 4de447223608efe8946b67e1d7310adfff3776a2 Mon Sep 17 00:00:00 2001
+From: Seele Volleri <33335@disroot.org>
+Date: Mon, 16 Feb 2026 21:49:55 +0000
+Subject: [PATCH 3/5] media: uvcvideo: implement Dell 0JCXG0 IR mode switching
+ control
+
+Implement IR mode switching for the Dell 0JCXG0 camera (Realtek
+0bda:5767).  This module contains two cameras (RGB and IR) behind a
+single USB interface.  Only one mode can be active at a time.
+Switching requires a proprietary Extension Unit control sequence,
+reverse-engineered from Windows Hello driver USB captures.
+
+The mode is exposed through V4L2_CID_BAND_STOP_FILTER (IR cut filter):
+  - value 1 (default): RGB mode (IR cut filter enabled)
+  - value 0: IR mode (IR cut filter disabled)
+
+The camera's Extension Unit (ID 4) uses a two-register protocol:
+  - Selector 0x0a: command/address register
+  - Selector 0x0b: data register
+
+Before accessing the data register, the firmware requires a four-step
+prep sequence to set the target register address.  This is wired up
+via the prepare callback added in the previous patch.  The stream
+suspend flag is also set, since the camera enters a corrupted state
+(broken output, e.g. black-and-white frames on RGB) if modes are
+switched while streaming.
+
+A flags fixup entry is added because the device returns incorrect
+capability flags via GET_INFO for the XU control.
+
+Signed-off-by: Seele Volleri <33335@disroot.org>
+---
+ drivers/media/usb/uvc/uvc_ctrl.c | 158 +++++++++++++++++++++++++++++++
+ 1 file changed, 158 insertions(+)
+
+diff --git a/drivers/media/usb/uvc/uvc_ctrl.c b/drivers/media/usb/uvc/uvc_ctrl.c
+index 44f0124dfb31..478277fcdb2e 100644
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@ -385,6 +385,16 @@ static const struct uvc_control_info uvc_ctrls[] = {
+ 				| UVC_CTRL_FLAG_GET_RANGE
+ 				| UVC_CTRL_FLAG_RESTORE,
+ 	},
++	/* Dell 0JCXG0 IR camera data register (selector 0x0b). */
++	{
++		.entity		= UVC_GUID_DELL_0JCXG0_XU,
++		.selector	= 0x0b,
++		.index		= 10,
++		.size		= 8,
++		.flags		= UVC_CTRL_FLAG_SET_CUR
++				| UVC_CTRL_FLAG_GET_CUR
++				| UVC_CTRL_FLAG_GET_DEF,
++	},
+ };
+ 
+ static const u32 uvc_control_classes[] = {
+@@ -555,6 +565,127 @@ static int uvc_ctrl_set_rel_speed(struct uvc_control_mapping *mapping,
+ 	return 0;
+ }
+ 
++/*
++ * Dell 0JCXG0 IR mode control callbacks.
++ *
++ * This module contains two cameras (RGB and IR) behind a single USB
++ * interface.  Register 0x9f00 selects which mode is active:
++ *   0x01 = RGB (default), 0x00 = IR.
++ *
++ * The data register (selector 0x0b) returns 8 bytes; only byte[0]
++ * carries the mode value.
++ *
++ * V4L2_CID_BAND_STOP_FILTER: 1 = RGB mode, 0 = IR mode.
++ */
++static int uvc_ctrl_get_dell_ir(struct uvc_control_mapping *mapping, u8 query,
++				const void *uvc_in, size_t v4l2_size,
++				void *v4l2_out)
++{
++	s32 *out = v4l2_out;
++	const u8 *data = uvc_in;
++
++	if (v4l2_size != sizeof(s32))
++		return -EINVAL;
++
++	switch (query) {
++	case UVC_GET_CUR:
++		*out = data[0] ? 1 : 0;
++		break;
++	case UVC_GET_MIN:
++		*out = 0;
++		break;
++	case UVC_GET_MAX:
++	case UVC_GET_DEF:
++	case UVC_GET_RES:
++		*out = 1;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int uvc_ctrl_set_dell_ir(struct uvc_control_mapping *mapping,
++				size_t v4l2_size, const void *v4l2_in,
++				void *uvc_out)
++{
++	const s32 *in = v4l2_in;
++	u8 *data = uvc_out;
++
++	if (v4l2_size != sizeof(s32))
++		return -EINVAL;
++
++	memset(data, 0, 8);
++	data[0] = *in ? 0x01 : 0x00;
++
++	return 0;
++}
++
++/*
++ * Dell 0JCXG0 IR camera register access prep sequence.
++ *
++ * The Extension Unit uses a two-register protocol: selector 0x0a is the
++ * command/address register, selector 0x0b is the data register.  Before any
++ * GET_CUR or SET_CUR on the data register, the firmware requires:
++ *
++ *   1. Send 0xff reset command to selector 0x0a
++ *   2. Set address to 0xfb00 (len=5) via selector 0x0a
++ *   3. Read from selector 0x0b (primes the firmware state machine)
++ *   4. Set address to 0x9f00 (len=1) via selector 0x0a
++ *
++ * Without steps 2-3, mode switches (especially back to IR) fail silently.
++ */
++static int uvc_ctrl_dell_ir_prep(struct uvc_device *dev,
++				 struct uvc_control *ctrl)
++{
++	u8 *cmd;
++	int ret;
++
++	cmd = kmalloc(8, GFP_KERNEL);
++	if (!cmd)
++		return -ENOMEM;
++
++	/* Step 1: reset command (0xff) to selector 0x0a. */
++	memset(cmd, 0, 8);
++	cmd[0] = 0xff;
++	ret = uvc_query_ctrl(dev, UVC_SET_CUR, ctrl->entity->id,
++			     dev->intfnum, 0x0a, cmd, 8);
++	if (ret < 0)
++		goto out;
++
++	/* Step 2: set address register to 0xfb00 (len=5). */
++	memset(cmd, 0, 8);
++	cmd[1] = 0xfb;
++	cmd[4] = 0x05;
++	ret = uvc_query_ctrl(dev, UVC_SET_CUR, ctrl->entity->id,
++			     dev->intfnum, 0x0a, cmd, 8);
++	if (ret < 0)
++		goto out;
++
++	/*
++	 * Step 3: read from data register (result ignored).
++	 * This triggers a state machine transition in the firmware.
++	 * Failure is non-fatal; log and continue.
++	 */
++	memset(cmd, 0, 8);
++	ret = uvc_query_ctrl(dev, UVC_GET_CUR, ctrl->entity->id,
++			     dev->intfnum, 0x0b, cmd, 8);
++	if (ret < 0)
++		uvc_dbg(dev, CONTROL,
++			"Dell IR: prep step 3 GET_CUR failed (%d)\n", ret);
++
++	/* Step 4: set address register to 0x9f00 (len=1). */
++	memset(cmd, 0, 8);
++	cmd[1] = 0x9f;
++	cmd[4] = 0x01;
++	ret = uvc_query_ctrl(dev, UVC_SET_CUR, ctrl->entity->id,
++			     dev->intfnum, 0x0a, cmd, 8);
++out:
++	kfree(cmd);
++	return ret;
++}
++
+ static const struct uvc_control_mapping uvc_ctrl_power_line_mapping_limited = {
+ 	.id		= V4L2_CID_POWER_LINE_FREQUENCY,
+ 	.entity		= UVC_GUID_UVC_PROCESSING,
+@@ -1009,6 +1140,18 @@ static const struct uvc_control_mapping uvc_ctrl_mappings[] = {
+ 		.menu_mask	= BIT(V4L2_COLORFX_VIVID) |
+ 				  BIT(V4L2_COLORFX_NONE),
+ 	},
++	/* Dell 0JCXG0 IR mode switch (IR cut filter on/off). */
++	{
++		.id		= V4L2_CID_BAND_STOP_FILTER,
++		.entity		= UVC_GUID_DELL_0JCXG0_XU,
++		.selector	= 0x0b,
++		.size		= 64,
++		.offset		= 0,
++		.v4l2_type	= V4L2_CTRL_TYPE_BOOLEAN,
++		.data_type	= UVC_CTRL_DATA_TYPE_UNSIGNED,
++		.get		= uvc_ctrl_get_dell_ir,
++		.set		= uvc_ctrl_set_dell_ir,
++	},
+ };
+ 
+ /* ------------------------------------------------------------------------
+@@ -2712,6 +2855,10 @@ static void uvc_ctrl_fixup_xu_info(struct uvc_device *dev,
+ 			UVC_CTRL_FLAG_GET_MIN | UVC_CTRL_FLAG_GET_MAX |
+ 			UVC_CTRL_FLAG_GET_DEF | UVC_CTRL_FLAG_SET_CUR |
+ 			UVC_CTRL_FLAG_AUTO_UPDATE },
++		/* Dell 0JCXG0 IR Camera: XU entity 4, selector 0x0b. */
++		{ { USB_DEVICE(0x0bda, 0x5767) }, 4, 0x0b,
++			UVC_CTRL_FLAG_GET_CUR | UVC_CTRL_FLAG_SET_CUR |
++			UVC_CTRL_FLAG_GET_DEF },
+ 	};
+ 
+ 	unsigned int i;
+@@ -3251,6 +3398,9 @@ static void uvc_ctrl_init_ctrl(struct uvc_video_chain *chain,
+ 
+ 		if (uvc_entity_match_guid(ctrl->entity, info->entity) &&
+ 		    ctrl->index == info->index) {
++			static const u8 dell_ir_guid[] =
++				UVC_GUID_DELL_0JCXG0_XU;
++
+ 			uvc_ctrl_add_info(chain->dev, ctrl, info);
+ 			/*
+ 			 * Retrieve control flags from the device. Ignore errors
+@@ -3259,6 +3409,14 @@ static void uvc_ctrl_init_ctrl(struct uvc_video_chain *chain,
+ 			 * GET_INFO on standard controls.
+ 			 */
+ 			uvc_ctrl_get_flags(chain->dev, ctrl, &ctrl->info);
++			uvc_ctrl_fixup_xu_info(chain->dev, ctrl, &ctrl->info);
++
++			if (uvc_entity_match_guid(ctrl->entity,
++						  dell_ir_guid) &&
++			    info->selector == 0x0b) {
++				ctrl->prepare = uvc_ctrl_dell_ir_prep;
++				ctrl->need_suspend = true;
++			}
+ 			break;
+ 		 }
+ 	}
+-- 
+2.47.3
+

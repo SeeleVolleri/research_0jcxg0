@@ -1,0 +1,101 @@
+From a3c74755896a9943a4aa7f2e16398fccc3880e87 Mon Sep 17 00:00:00 2001
+From: Seele Volleri <33335@disroot.org>
+Date: Mon, 16 Feb 2026 21:45:18 +0000
+Subject: [PATCH 1/5] media: uvcvideo: add prepare callback and stream suspend
+ for controls
+
+Add two new fields to struct uvc_control:
+
+  - prepare: optional callback invoked before GET_CUR/SET_CUR to allow
+    device-specific hardware setup (e.g., setting register addresses).
+
+  - need_suspend: when true, the video stream is suspended before
+    SET_CUR and resumed after, for devices that cannot switch modes
+    while streaming.
+
+These hooks are called from __uvc_ctrl_load_cur() and
+uvc_ctrl_commit_entity() respectively, keeping the generic control
+paths free of device-specific logic.
+
+Signed-off-by: Seele Volleri <33335@disroot.org>
+---
+ drivers/media/usb/uvc/uvc_ctrl.c | 37 +++++++++++++++++++++++++++++---
+ drivers/media/usb/uvc/uvcvideo.h |  5 +++++
+ 2 files changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_ctrl.c b/drivers/media/usb/uvc/uvc_ctrl.c
+index 2905505c240c..44f0124dfb31 100644
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@ -1307,6 +1307,12 @@ static int __uvc_ctrl_load_cur(struct uvc_video_chain *chain,
+ 		return 0;
+ 	}
+ 
++	if (ctrl->prepare) {
++		ret = ctrl->prepare(chain->dev, ctrl);
++		if (ret < 0)
++			return ret;
++	}
++
+ 	if (ctrl->entity->get_cur)
+ 		ret = ctrl->entity->get_cur(chain->dev, ctrl->entity,
+ 					    ctrl->info.selector, data,
+@@ -2224,11 +2230,36 @@ static int uvc_ctrl_commit_entity(struct uvc_device *dev,
+ 		if (!ctrl->dirty)
+ 			continue;
+ 
+-		if (!rollback)
+-			ret = uvc_query_ctrl(dev, UVC_SET_CUR, ctrl->entity->id,
+-				dev->intfnum, ctrl->info.selector,
++		if (!rollback) {
++			struct uvc_streaming *stream = NULL;
++
++			if (ctrl->need_suspend) {
++				list_for_each_entry(stream, &dev->streams,
++						    list) {
++					if (uvc_queue_streaming(&stream->queue))
++						break;
++				}
++				if (&stream->list == &dev->streams)
++					stream = NULL;
++				if (stream)
++					uvc_video_suspend(stream);
++			}
++
++			if (ctrl->prepare) {
++				ret = ctrl->prepare(dev, ctrl);
++				if (ret < 0)
++					goto commit_done;
++			}
++
++			ret = uvc_query_ctrl(dev, UVC_SET_CUR,
++				ctrl->entity->id, dev->intfnum,
++				ctrl->info.selector,
+ 				uvc_ctrl_data(ctrl, UVC_CTRL_DATA_CURRENT),
+ 				ctrl->info.size);
++commit_done:
++			if (stream)
++				uvc_video_resume(stream, 0);
++		}
+ 
+ 		if (!ret)
+ 			processed_ctrls++;
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index ed7bad31f75c..ac316c356fc6 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -161,6 +161,11 @@ struct uvc_control {
+ 
+ 	u8 *uvc_data;
+ 
++	/* Optional callback to prepare hardware before GET_CUR/SET_CUR. */
++	int (*prepare)(struct uvc_device *dev, struct uvc_control *ctrl);
++	/* If true, suspend video stream before SET_CUR and resume after. */
++	bool need_suspend;
++
+ 	struct uvc_fh *handle;	/* File handle that last changed the control. */
+ };
+ 
+-- 
+2.47.3
+
